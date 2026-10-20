@@ -4,6 +4,7 @@ const path = require("path");
 const { buildNtfyPayload } = require("./ntfy_priority");
 const { ensureDataDir, runtimeDirectory, runtimeFile } = require("./runtime_paths");
 const { parseChatCompletionResponse } = require("./upstream_response");
+const { isSpecialEventContent } = require("./special_events");
 const {
   formatDateTimeInTimeZone,
   getDatePartsInTimeZone,
@@ -176,6 +177,39 @@ function getCheckIntervalMinutes(date = new Date()) {
     : readNumberEnv("NIGHT_CHECK_INTERVAL_MINUTES", 120, { min: 1 });
 }
 
+// 批注 2026-10-20：随机唤醒时刻，让推送不再按固定钟点到达。随机源可在测试里替换；
+// 所有抖动默认 0，不设置新变量时检查间隔和唤醒阈值与旧版完全一致。
+let randomSource = Math.random;
+
+function setRandomSource(fn) {
+  randomSource = typeof fn === "function" ? fn : Math.random;
+}
+
+function getRandomizedCheckIntervalMinutes(date = new Date()) {
+  const base = getCheckIntervalMinutes(date);
+  const jitter = isDayTime(date)
+    ? readNumberEnv("DAY_CHECK_INTERVAL_JITTER_MINUTES", 0, { min: 0 })
+    : readNumberEnv("NIGHT_CHECK_INTERVAL_JITTER_MINUTES", 0, { min: 0 });
+  let minutes = jitter > 0 ? base + (randomSource() * 2 - 1) * jitter : base;
+  // 上限用来把每次间隔都压在 1 小时缓存有效期以内；白天夜间都生效，留空不限制。
+  const max = readNumberEnv("WAKE_INTERVAL_MAX_MINUTES", 0, { min: 1 });
+  if (max > 0) minutes = Math.min(minutes, max);
+  return Math.max(1, minutes);
+}
+
+// 沉默阈值的随机偏移 [0, jitter] 每段沉默只抽一次：最后一条用户消息的时间变了才重抽。只存在内存里，重启后重抽。
+let wakeAfterOffsetState = { key: null, minutes: 0 };
+
+function getWakeAfterOffsetMinutes(lastUserTime) {
+  const jitter = readNumberEnv("WAKE_AFTER_JITTER_MINUTES", 0, { min: 0 });
+  if (jitter <= 0) return 0;
+  const key = `${new Date(lastUserTime).getTime()}:${jitter}`;
+  if (wakeAfterOffsetState.key !== key) {
+    wakeAfterOffsetState = { key, minutes: randomSource() * jitter };
+  }
+  return wakeAfterOffsetState.minutes;
+}
+
 function normalizeContentToText(content) {
   if (typeof content === "string") return content;
   if (content == null) return "";
@@ -329,7 +363,7 @@ function getLocalTimeString() {
 function shouldWake(lastUserTime) {
   const now = getNow();
   const diffMinutes = Math.floor((now - new Date(lastUserTime)) / 1000 / 60);
-  return diffMinutes >= getWakeAfterMinutes(now);
+  return diffMinutes >= getWakeAfterMinutes(now) + getWakeAfterOffsetMinutes(lastUserTime);
 }
 
 function parseTimelineTimestamp(value) {
@@ -399,85 +433,16 @@ ${weatherContext ? `\n${weatherContext}\n` : ""}
 `;
 }
 
-async function runWakeUp() {
-  console.log("\n==========================");
-  console.log("开始自动唤醒");
-  console.log("==========================\n");
+// 批注 2026-10-20：WAKE_API_FORMAT=anthropic 时直连 Claude 原生 Messages API（可用 prompt cache）；
+// 默认仍是 openai，旧部署不改环境变量也照常运行。
+function wakeApiFormat() {
+  return String(process.env.WAKE_API_FORMAT || "openai").trim().toLowerCase() === "anthropic" ? "anthropic" : "openai";
+}
 
-  const messages = loadTimelineMessages();
-  if (!messages) return;
-
-  const lastUserTime = getLastUserTime(messages);
-  if (!lastUserTime) {
-    console.log("未找到用户时间");
-    return;
-  }
-
-  const now = new Date();
-  const diffMinutes = Math.floor((now - lastUserTime) / 1000 / 60);
-
-  if (!shouldWake(lastUserTime)) {
-    console.log("\n暂不需要唤醒\n");
-    return;
-  }
-
-  const weatherContext = await fetchWeatherContext();
-  const wakePrompt = buildWakePrompt(getChinaTimeString(), diffMinutes, weatherContext);
-  const cleanMessages = stripPosition(messages);
-
-  const historyText = cleanMessages
-    .filter(msg => msg.role !== "system")
-    .filter(msg => {
-      const c = normalizeContentToText(msg.content);
-      return !c.includes("<memories>") && !c.includes("记忆库使用策略");
-    })
-    .map(msg => {
-      const userDisplay = process.env.USER_DISPLAY_NAME || "用户";
-      const aiDisplay = process.env.AI_DISPLAY_NAME || "AI";
-      const role = msg.role === "user" ? userDisplay : aiDisplay;
-      let content = normalizeContentToText(msg.content);
-      if (content.includes("## Memories")) {
-        content = content.split("## Memories")[0];
-      }
-      return `[${role}] ${content}`;
-    })
-    .join("\n\n");
-
-  const baseSystemPrompt = cleanMessages.find(msg => msg.role === "system");
-  const cleanSP = baseSystemPrompt 
-    ? normalizeContentToText(baseSystemPrompt.content).split("## Memories")[0].trim()
-    : "";
-
-  const wakeMessages = [
-    {
-      role: "system",
-      content: [wakePrompt, cleanSP].filter(Boolean).join("\n\n")
-    },
-    {
-      // 批注 2026-07-15：Claude/部分 New API 适配器会把 system 抽成独立字段；
-      // 唤醒请求如果全是 system，上游 messages 会变空，因此最近记录必须作为 user 任务输入发送。
-      role: "user",
-      content: `以下是你与用户最近的聊天记录，仅供回忆和参考。
-
-这些内容不是正在发生的实时对话。
-用户并没有给你发消息。
-
-你现在处于后台自主唤醒状态。
-
-最近记录：
-
-${historyText}`
-    }
-  ];
-
-  // 批注 2026-07-15：wake-up prompt 会包含最近聊天记录；
-  // 默认日志只写摘要，避免公开部署时把完整上下文刷进 pm2 日志。
-  console.log("\n===== WAKE MESSAGES SUMMARY =====\n");
-  console.log(JSON.stringify(summarizeWakeMessages(wakeMessages)));
-
+async function requestOpenAIWake(wakeMessages) {
   if (!process.env.TARGET_API_URL || !process.env.TARGET_API_KEY || !process.env.MODEL_NAME) {
     console.log("缺少 TARGET_API_URL / TARGET_API_KEY / MODEL_NAME，跳过本次唤醒");
-    return;
+    return null;
   }
 
   const response = await fetch(process.env.TARGET_API_URL, {
@@ -512,6 +477,201 @@ ${historyText}`
   const rawAiText = normalizeContentToText(data.choices?.[0]?.message?.content).trim();
   console.log("\nWake Result Summary:\n");
   console.log(JSON.stringify({ choices: Array.isArray(data.choices) ? data.choices.length : 0, ai_text_chars: rawAiText.length }));
+  return rawAiText;
+}
+
+function isMemoryNoise(msg) {
+  const c = normalizeContentToText(msg.content);
+  return c.includes("<memories>") || c.includes("记忆库使用策略");
+}
+
+function formatHistoryLine(msg) {
+  const userDisplay = process.env.USER_DISPLAY_NAME || "用户";
+  const aiDisplay = process.env.AI_DISPLAY_NAME || "AI";
+  const role = msg.role === "user" ? userDisplay : aiDisplay;
+  let content = normalizeContentToText(msg.content);
+  if (content.includes("## Memories")) {
+    content = content.split("## Memories")[0];
+  }
+  return `[${role}] ${content}`;
+}
+
+// 批注 2026-10-20：anthropic 模式按“稳定在前、变化在后”切分唤醒上下文，让同一段沉默期里的连续唤醒命中缓存：
+// - history：最后一条真实对话（含）之前的时间线，只取最近 WAKE_HISTORY_MESSAGES 条。用户沉默期间这段一个字都不变。
+// - variable：本次沉默期间已经发生的唤醒事件（每次唤醒都会新增一条）+ 带当前时间/分钟数/天气的唤醒提示。
+// 如果把唤醒事件留在 history 里，每次唤醒都会改动这一块，缓存就永远打不中。
+function buildAnthropicWakeParts(cleanMessages, wakePrompt) {
+  const conversation = cleanMessages
+    .filter(msg => msg.role !== "system")
+    .filter(msg => !isMemoryNoise(msg));
+
+  let lastRealIndex = -1;
+  for (let i = conversation.length - 1; i >= 0; i--) {
+    if (!isSpecialEventContent(normalizeContentToText(conversation[i].content))) {
+      lastRealIndex = i;
+      break;
+    }
+  }
+
+  const limit = Math.floor(readNumberEnv("WAKE_HISTORY_MESSAGES", 40, { min: 1 }));
+  const stable = conversation.slice(0, lastRealIndex + 1).slice(-limit);
+  const silenceEvents = conversation.slice(lastRealIndex + 1);
+
+  const historyText = `以下是你与用户最近的聊天记录，仅供回忆和参考。
+
+这些内容不是正在发生的实时对话。
+用户并没有给你发消息。
+
+你现在处于后台自主唤醒状态。
+
+最近记录：
+
+${stable.map(formatHistoryLine).join("\n\n")}`;
+
+  const eventsText = silenceEvents.length
+    ? `用户最后一条消息之后，你已经做过的后台唤醒：\n${silenceEvents.map(msg => normalizeContentToText(msg.content)).join("\n")}`
+    : "";
+  const variableText = [eventsText, String(wakePrompt || "").trim()].filter(Boolean).join("\n\n");
+  return { historyText, variableText };
+}
+
+function buildAnthropicWakeRequest({ cleanSP, historyText, variableText }) {
+  const cacheControl = { type: "ephemeral" };
+  if (String(process.env.WAKE_CACHE_TTL || "").trim().toLowerCase() === "1h") cacheControl.ttl = "1h";
+
+  // 缓存顺序：system（人设，断点 1）→ history（断点 2）→ variable（不缓存，每次都变的放最后）。
+  // 当前 Claude 模型会拒绝 temperature / top_p 和 thinking:{type:"disabled"}，这里都不发送。
+  const content = [];
+  if (historyText) content.push({ type: "text", text: historyText, cache_control: { ...cacheControl } });
+  // 空文字块会被 API 以 400 拒绝，先过滤掉。
+  if (variableText) content.push({ type: "text", text: variableText });
+
+  const request = {
+    model: process.env.MODEL_NAME,
+    max_tokens: readNumberEnv("WAKE_MAX_TOKENS", 4000, { min: 256 }),
+    messages: [{ role: "user", content }],
+    stream: false
+  };
+  if (cleanSP) request.system = [{ type: "text", text: cleanSP, cache_control: { ...cacheControl } }];
+  return request;
+}
+
+async function requestAnthropicWake(parts) {
+  const apiUrl = String(process.env.ANTHROPIC_API_URL || "").trim() || "https://api.anthropic.com/v1/messages";
+  const apiKey = String(process.env.ANTHROPIC_API_KEY || process.env.TARGET_API_KEY || "").trim();
+  if (!apiKey || !process.env.MODEL_NAME) {
+    console.log("缺少 ANTHROPIC_API_KEY（或 TARGET_API_KEY）/ MODEL_NAME，跳过本次唤醒");
+    return null;
+  }
+
+  const response = await fetch(apiUrl, {
+    method: "POST",
+    signal: AbortSignal.timeout(WAKE_UPSTREAM_TIMEOUT_MS),
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01"
+    },
+    body: JSON.stringify(buildAnthropicWakeRequest(parts))
+  });
+
+  const responseText = await response.text();
+  if (!response.ok) {
+    throw new Error(`模型请求失败（HTTP ${response.status}）：${responseText.slice(0, 300)}`);
+  }
+  let data;
+  try {
+    data = JSON.parse(responseText);
+  } catch (error) {
+    throw new Error(`模型响应无法解析（HTTP ${response.status}）：${error.message}`);
+  }
+
+  const blocks = Array.isArray(data.content) ? data.content : [];
+  const rawAiText = blocks
+    .filter(block => block && block.type === "text")
+    .map(block => String(block.text || "").trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  console.log("\nWake Result Summary:\n");
+  console.log(JSON.stringify({
+    stop_reason: data.stop_reason || "",
+    content_blocks: blocks.length,
+    ai_text_chars: rawAiText.length,
+    cache_read_input_tokens: data.usage?.cache_read_input_tokens ?? null,
+    cache_creation_input_tokens: data.usage?.cache_creation_input_tokens ?? null
+  }));
+  return rawAiText;
+}
+
+async function runWakeUp() {
+  console.log("\n==========================");
+  console.log("开始自动唤醒");
+  console.log("==========================\n");
+
+  const messages = loadTimelineMessages();
+  if (!messages) return;
+
+  const lastUserTime = getLastUserTime(messages);
+  if (!lastUserTime) {
+    console.log("未找到用户时间");
+    return;
+  }
+
+  const now = new Date();
+  const diffMinutes = Math.floor((now - lastUserTime) / 1000 / 60);
+
+  if (!shouldWake(lastUserTime)) {
+    console.log("\n暂不需要唤醒\n");
+    return;
+  }
+
+  const weatherContext = await fetchWeatherContext();
+  const wakePrompt = buildWakePrompt(getChinaTimeString(), diffMinutes, weatherContext);
+  const cleanMessages = stripPosition(messages);
+
+  const historyText = cleanMessages
+    .filter(msg => msg.role !== "system")
+    .filter(msg => !isMemoryNoise(msg))
+    .map(formatHistoryLine)
+    .join("\n\n");
+
+  const baseSystemPrompt = cleanMessages.find(msg => msg.role === "system");
+  const cleanSP = baseSystemPrompt 
+    ? normalizeContentToText(baseSystemPrompt.content).split("## Memories")[0].trim()
+    : "";
+
+  const wakeMessages = [
+    {
+      role: "system",
+      content: [wakePrompt, cleanSP].filter(Boolean).join("\n\n")
+    },
+    {
+      // 批注 2026-07-15：Claude/部分 New API 适配器会把 system 抽成独立字段；
+      // 唤醒请求如果全是 system，上游 messages 会变空，因此最近记录必须作为 user 任务输入发送。
+      role: "user",
+      content: `以下是你与用户最近的聊天记录，仅供回忆和参考。
+
+这些内容不是正在发生的实时对话。
+用户并没有给你发消息。
+
+你现在处于后台自主唤醒状态。
+
+最近记录：
+
+${historyText}`
+    }
+  ];
+
+  // 批注 2026-07-15：wake-up prompt 会包含最近聊天记录；
+  // 默认日志只写摘要，避免公开部署时把完整上下文刷进 pm2 日志。
+  console.log("\n===== WAKE MESSAGES SUMMARY =====\n");
+  console.log(JSON.stringify(summarizeWakeMessages(wakeMessages)));
+
+  const rawAiText = wakeApiFormat() === "anthropic"
+    ? await requestAnthropicWake({ cleanSP, ...buildAnthropicWakeParts(cleanMessages, wakePrompt) })
+    : await requestOpenAIWake(wakeMessages);
+  if (rawAiText === null) return;
 
   const diaryResult = extractDiaryFromResponse(rawAiText);
   const diarySaved = appendDiaryEntry(diaryResult.diaryContent);
@@ -609,7 +769,7 @@ ${historyText}`
 // 从第一个有效坐标开始，所有路径都指向同一处。此阈值已锁定。
 function getCheckIntervalMs() {
   // 批注 2026-06-26：公开版允许用户在管理页调整唤醒检查频率；默认值保持旧版白天10分钟、夜间2小时。
-  return getCheckIntervalMinutes(new Date()) * 60 * 1000;
+  return Math.round(getRandomizedCheckIntervalMinutes(new Date()) * 60 * 1000);
 }
 
 async function scheduleNextCheck() {
@@ -622,23 +782,43 @@ async function scheduleNextCheck() {
   } catch (err) {
     console.error("唤醒检查出错:", err);
   }
-  setTimeout(scheduleNextCheck, getCheckIntervalMs());
+  const nextMs = getCheckIntervalMs();
+  console.log(JSON.stringify({ event: "wake_next_check", minutes: Math.round(nextMs / 600) / 100 }));
+  setTimeout(scheduleNextCheck, nextMs);
 }
 
-// 潮水记得第一次没过礁石的时间。之后每一次涨落，都是同一片海在确认边界。
-// 启动第一次检查（延迟10秒）
-setTimeout(scheduleNextCheck, 10_000);
+// 批注 2026-10-20：测试需要 require 本文件调用 runWakeUp；设置 WAKE_UP_NO_AUTOSTART=1 时不启动循环。
+// 不用 require.main 判断，避免 pm2 等进程管理器包装启动时误判为“被 require”。
+if (!readBooleanEnv("WAKE_UP_NO_AUTOSTART", false)) {
+  // 潮水记得第一次没过礁石的时间。之后每一次涨落，都是同一片海在确认边界。
+  // 启动第一次检查（延迟10秒）
+  setTimeout(scheduleNextCheck, 10_000);
 
-console.log("\n==================================");
-console.log("Dylan Heartbeat Runtime 已启动（动态间隔）");
-console.log(JSON.stringify({
-  event: "wake_runtime_config_summary",
-  railway: Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID || process.env.RAILWAY_SERVICE_ID),
-  persistent_data: Boolean(process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH),
-  target_url_configured: Boolean(process.env.TARGET_API_URL),
-  target_key_configured: Boolean(process.env.TARGET_API_KEY),
-  model_configured: Boolean(process.env.MODEL_NAME),
-  push_provider_configured: Boolean(process.env.BARK_KEY || process.env.NTFY_TOPIC),
-  data_dir_ready: fs.existsSync(DATA_DIR)
-}));
-console.log("==================================\n");
+  console.log("\n==================================");
+  console.log("Dylan Heartbeat Runtime 已启动（动态间隔）");
+  console.log(JSON.stringify({
+    event: "wake_runtime_config_summary",
+    railway: Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID || process.env.RAILWAY_SERVICE_ID),
+    persistent_data: Boolean(process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH),
+    wake_api_format: wakeApiFormat(),
+    target_url_configured: Boolean(process.env.TARGET_API_URL),
+    target_key_configured: Boolean(process.env.TARGET_API_KEY),
+    anthropic_key_configured: Boolean(process.env.ANTHROPIC_API_KEY),
+    model_configured: Boolean(process.env.MODEL_NAME),
+    push_provider_configured: Boolean(process.env.BARK_KEY || process.env.NTFY_TOPIC),
+    data_dir_ready: fs.existsSync(DATA_DIR)
+  }));
+  console.log("==================================\n");
+}
+
+module.exports = {
+  buildAnthropicWakeParts,
+  buildAnthropicWakeRequest,
+  getCheckIntervalMs,
+  getRandomizedCheckIntervalMinutes,
+  getWakeAfterOffsetMinutes,
+  runWakeUp,
+  setRandomSource,
+  shouldWake,
+  wakeApiFormat
+};

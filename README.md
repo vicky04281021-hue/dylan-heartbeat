@@ -36,6 +36,7 @@
 - [已 Fork / 部署过的人怎么更新？](#-已-fork--部署过的人怎么更新)
 - [更新日志](#-更新日志2026-08-10)
 - [开始教程](#-开始教程)
+- [使用 Claude 原生 API（保留缓存）](#-使用-claude-原生-api保留缓存)
 - [管理页面](#-管理页面web-控制台)
 - [自动唤醒策略](#-自动唤醒策略)
 - [天气注入](#-天气注入)
@@ -71,6 +72,8 @@ Bark / ntfy 推送 → 你的手机
 |------|------|
 | `server.js` | 主 Gateway。转发请求、维护时间线、注入推送事件、提供管理页面。 |
 | `wake_up.js` | 自动唤醒 Runtime。按间隔唤醒 AI，生成推送或静默，发送到手机，写入时间线。 |
+| `anthropic_native.js` | Claude 原生 Messages API 的辅助函数：提取文本块、只追加的事件注入、SSE 文本累积。 |
+| `native_injections.json` | **原生路径注入记录**。记住每次注入到哪条用户消息、注入了什么，之后每轮原样补回，保住 prompt cache 和 thinking 签名。 |
 | `enhanced_messages.json` | **AI 世界时间线**。SP + 真实对话 + 推送事件。不是日志，是 AI 的当前世界。 |
 | `message_timestamps.json` | **时间戳记忆库**。通过内容指纹记录每条消息的原始时间，找回历史消息时间。 |
 | `diary/` | **自动日记目录**。当 AI 主动输出 `[DIARY]...[/DIARY]` 时，会按日期追加保存。 |
@@ -127,6 +130,12 @@ node wake_up.js
 - 最后一定要重启 `gateway` 和 `wake-up`
 
 ---
+
+## 📋 更新日志（2026-10-20）
+
+- 🟠 新增 Claude 原生 Messages API 支持：Gateway 新增 `POST /v1/messages`，Kelivo 选 Claude 类型供应商即可直连，`system`、`cache_control`、`thinking`（含签名）原样透传，prompt cache 正常生效。OpenAI 路径保持不变。
+- ⏰ wake-up 新增 `WAKE_API_FORMAT=anthropic`：唤醒请求直接走原生 API，人设 SP 放进带缓存标记的 `system`，不再发送 Claude 新模型会拒绝的 `temperature` / `top_p`。
+- 详见下方 [使用 Claude 原生 API（保留缓存）](#-使用-claude-原生-api保留缓存)。
 
 ## 📋 更新日志（2026-08-10）
 
@@ -316,6 +325,80 @@ http://你的电脑局域网IP:3000/v1/chat/completions
 ```
 
 > 电脑 IP 可在终端执行 `ifconfig | grep "inet " | grep -v 127.0.0.1` 查看（通常为 `192.168.x.x` 或 `172.16.x.x`）。
+
+---
+
+## 🟠 使用 Claude 原生 API（保留缓存）
+
+Anthropic 的 OpenAI 兼容端点不支持 prompt caching。长上下文的陪伴聊天每轮都要重发整段历史，走兼容端点大约会贵十倍。Gateway 现在同时提供原生的 `POST /v1/messages`，旧的 `/v1/chat/completions` 照常可用。
+
+### 1. 服务器环境变量（Railway Variables）
+
+```env
+ANTHROPIC_API_KEY=sk-ant-你的Key
+ANTHROPIC_API_URL=https://api.anthropic.com/v1/messages
+WAKE_API_FORMAT=anthropic
+MODEL_NAME=claude-opus-5-5
+ALLOW_PUBLIC_API=true
+GATEWAY_API_KEY=请改成随机长密码
+TIME_ZONE=Europe/London
+# 省钱 + 随机唤醒推荐（原因见下方“唤醒费用”和“随机唤醒时刻”）
+WAKE_CACHE_TTL=1h
+WAKE_HISTORY_MESSAGES=40
+DAY_CHECK_INTERVAL_MINUTES=45
+DAY_CHECK_INTERVAL_JITTER_MINUTES=12
+WAKE_INTERVAL_MAX_MINUTES=57
+WAKE_AFTER_JITTER_MINUTES=60
+# 白天 8:00–24:00，夜里也会唤醒，只是阈值放宽到 2 小时
+WAKE_DAY_START_HOUR=8
+WAKE_DAY_END_HOUR=24
+NIGHT_WAKE_AFTER_MINUTES=120
+NIGHT_CHECK_INTERVAL_MINUTES=45
+NIGHT_CHECK_INTERVAL_JITTER_MINUTES=12
+```
+
+- `ANTHROPIC_API_URL` 默认就是官方地址，可以不填；`ANTHROPIC_API_KEY` 留空时会回退使用 `TARGET_API_KEY`。
+- `WAKE_API_FORMAT=anthropic` 让自动唤醒也走原生 API；不设置时默认仍是 `openai`，旧部署不受影响。
+- `TIME_ZONE` 填你所在地的时区（在英国就是 `Europe/London`），时间线和唤醒时段都按它计算。
+- `WAKE_HISTORY_MESSAGES`：唤醒时最多带多少条最近聊天记录，默认 `40`，用来控制每次唤醒的 token 量（只影响 anthropic 模式）。
+- `WAKE_MAX_TOKENS`：唤醒回复的上限，默认 `4000`，Claude 的思考也计入这里。
+
+#### 唤醒费用：为什么检查间隔要压在 57 分钟以内 + 一小时缓存
+
+用户一直不回消息时，wake-up 会按检查间隔反复唤醒模型，每次都要把人设和聊天记录重新发一遍（常见 3 万 token 以上）。anthropic 模式把请求排成“人设（缓存）→ 聊天记录（缓存）→ 当前时间、沉默分钟数、天气和本次沉默期间已做过的唤醒（不缓存，放最后）”，所以同一段沉默里的第二次及以后的唤醒，前面那一大段都按缓存价读取，只有十分之一左右的价格。
+
+- 缓存只有在**下一次唤醒落在有效期内**时才命中。默认缓存只有 5 分钟，而检查间隔至少 10 分钟，等于每次都重新写缓存（写缓存比普通输入还贵）。所以要设 `WAKE_CACHE_TTL=1h`。
+- 检查间隔要**略短于一小时**。程序是在上一次检查结束后才开始计时的，设成整 60 分钟时两次请求之间会多出几秒，刚好错过一小时的缓存，每次都按两倍价格重新写入，比不缓存还贵。所以用 `WAKE_INTERVAL_MAX_MINUTES=57` 给每次随机后的间隔封顶，留出几分钟余量。这个上限白天和夜间都生效，夜里 45 ± 12 分钟的随机间隔同样不会超过 57 分钟；没到沉默阈值的检查只读本地文件，不调用模型，不花钱。
+- 检查越密，唤醒次数越多。原来每 10 分钟一次，一整天沉默会调用七十多次；改成四十多分钟一次后大约十几次，而且大部分命中缓存。
+
+#### 随机唤醒时刻
+
+- `DAY_CHECK_INTERVAL_JITTER_MINUTES=12` / `NIGHT_CHECK_INTERVAL_JITTER_MINUTES=12`：每次检查间隔在 45 ± 12 分钟之间随机（再被 57 封顶），推送不会再整点、整刻地准时到达。
+- `WAKE_AFTER_JITTER_MINUTES=60`：你不说话之后，第一次主动联系在“阈值 + 随机 0~60 分钟”时出现（白天阈值 60 分钟，夜里 120 分钟）。这个随机量每段沉默只抽一次，你发了新消息才重新抽；重启 wake-up 也会重抽。
+- 白天时段是 `WAKE_DAY_START_HOUR=8` 到 `WAKE_DAY_END_HOUR=24`；0:00–8:00 算夜里，夜里同样会唤醒，只是要沉默更久（`NIGHT_WAKE_AFTER_MINUTES=120`）才会第一次联系你。
+- **夜里的推送可能会响。** 不想被吵醒的话，可以把 Bark 的推送铃声设成静音，或者打开 iOS 的“睡眠”专注模式，推送照样会到，早上醒来再看。
+- 所有抖动默认都是 `0`，不设置时和旧版的固定节奏完全一样。
+
+### 2. Kelivo 设置
+
+新建一个供应商：
+
+- **类型**：Claude
+- **API Base URL**：`https://<你的Railway域名>/v1`（Kelivo 会自动请求 `.../v1/messages`）
+- **API Key**：填 `GATEWAY_API_KEY` 的值，**不要**填 Anthropic 的 Key
+- **模型**：`claude-opus-5-5`
+
+Kelivo 里打开的思考、缓存、beta 头等设置都会原样转发：Gateway 只把 `x-api-key` 换成服务器上的 `ANTHROPIC_API_KEY`，`anthropic-version`、`anthropic-beta` 头和请求体全部透传。
+
+### 3. 唤醒事件怎么注入
+
+为了不打断缓存、不让 thinking 签名失效，原生路径**只追加、不改历史**：
+
+- 新的唤醒事件（推送 / 静默）只作为一个文字块，附在本次请求**最后一条用户消息**里，并标明“由系统自动附加，不是用户写的”；`system` 和更早的消息一个字节都不动。
+- 只注入上一轮回复之后发生的、还没注入过的事件。
+- 注入记录保存在 `native_injections.json`。下一轮 Kelivo 发回的是不带附注的原文，Gateway 会把同一段附注原样补回去，让模型看到的历史与上一轮完全一致。这个文件和时间线一样保存在运行数据目录（Railway 上就是 Volume）；没有挂 Volume 时，重新部署后带附注的那几条消息会对不上，缓存会断一次。
+
+可以在 Anthropic 控制台或响应的 `usage.cache_read_input_tokens` 里确认缓存是否命中。
 
 ---
 

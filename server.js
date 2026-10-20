@@ -13,6 +13,17 @@ const {
 const { isSpecialEventContent } = require("./special_events");
 const { decideRequestAccess } = require("./network_access");
 const {
+  DEFAULT_ANTHROPIC_API_URL,
+  DEFAULT_ANTHROPIC_VERSION,
+  anthropicBodyToTimelineMessages,
+  anthropicContentToText,
+  applyInjection,
+  buildInjectionNote,
+  createSseTextAccumulator,
+  extractResponseText,
+  injectionKey
+} = require("./anthropic_native");
+const {
   formatDateTimeInTimeZone,
   resolveTimeZone,
   zonedWallTimeToDate
@@ -46,6 +57,7 @@ const IS_RAILWAY_RUNTIME = Boolean(
 const DATA_DIR = ensureDataDir();
 const TIMELINE_FILE = runtimeFile("enhanced_messages.json");
 const TIMESTAMP_DB_FILE = runtimeFile("message_timestamps.json");
+const NATIVE_INJECTIONS_FILE = runtimeFile("native_injections.json");
 // 批注 2026-07-17：管理页保存 .env 后要让 PM2 刷新进程环境；保留原进程名，
 // 只补 --update-env，避免用户改完推送配置却继续运行旧值。
 const DEFAULT_RESTART_COMMAND = "pm2 restart gateway wake-up --update-env";
@@ -411,6 +423,210 @@ function stripPosition(messages) {
   return messages.map(({ position, ...rest }) => rest);
 }
 
+// 批注 2026-10-20：OpenAI 路径和 Claude 原生路径共用同一套“记时间戳 + 重建时间线”逻辑，
+// 保证 wake_up.js 看到的 enhanced_messages.json 格式不因上游格式而变化。
+function recordIncomingTimeline(kelivoMessages) {
+  const tsDB = loadTimestampDB();
+  let tsDBDirty = false;
+  for (const msg of kelivoMessages) {
+    if (msg.role === "system") continue;
+    if (msg.role === "tool") continue;
+    const ts = extractTimestamp(normalizeContentToText(msg.content));
+    if (!ts) continue;
+    const fp = makeFingerprint(msg);
+    const fpStripped = makeFingerprintStripped(msg);
+    if (!tsDB[fp]) { tsDB[fp] = ts.toISOString(); tsDBDirty = true; }
+    if (!tsDB[fpStripped]) { tsDB[fpStripped] = ts.toISOString(); tsDBDirty = true; }
+  }
+  if (tsDBDirty) saveTimestampDB(tsDB);
+
+  const finalTimeline = buildTimeline(kelivoMessages, tsDB);
+  saveTimeline(finalTimeline);
+  return tsDB;
+}
+
+// ========================
+// Claude 原生 Messages API 辅助
+// ========================
+function anthropicApiUrl() {
+  return String(process.env.ANTHROPIC_API_URL || "").trim() || DEFAULT_ANTHROPIC_API_URL;
+}
+
+function anthropicApiKey() {
+  // 批注 2026-10-20：优先用独立的 ANTHROPIC_API_KEY；未配置时才回退 TARGET_API_KEY，方便只换上游的旧部署。
+  return String(process.env.ANTHROPIC_API_KEY || process.env.TARGET_API_KEY || "").trim();
+}
+
+function anthropicError(type, message) {
+  return { type: "error", error: { type, message } };
+}
+
+function loadNativeInjectionStore() {
+  const empty = { entries: [], consumed_events: [], last_reply_at: null };
+  if (!fs.existsSync(NATIVE_INJECTIONS_FILE)) return empty;
+  try {
+    const data = fs.readJsonSync(NATIVE_INJECTIONS_FILE);
+    return {
+      entries: Array.isArray(data?.entries) ? data.entries : [],
+      consumed_events: Array.isArray(data?.consumed_events) ? data.consumed_events : [],
+      last_reply_at: data?.last_reply_at || null
+    };
+  } catch {
+    return empty;
+  }
+}
+
+function saveNativeInjectionStore(store) {
+  writeJsonAtomicSync(NATIVE_INJECTIONS_FILE, {
+    entries: store.entries.slice(-500),
+    consumed_events: store.consumed_events.slice(-500),
+    last_reply_at: store.last_reply_at || null
+  });
+}
+
+// Kelivo 的 Claude 供应商不一定给消息加时间前缀；时间线里的最后一条 user 消息没有时间时，
+// 用时间戳记忆库（或收到请求的此刻）补一个前缀，只写进时间线，不改发给上游的内容，wake_up.js 才知道用户何时说话。
+function ensureLastUserTimestamp(timelineMessages) {
+  for (let i = timelineMessages.length - 1; i >= 0; i--) {
+    const msg = timelineMessages[i];
+    if (msg.role !== "user") continue;
+    if (extractTimestamp(msg.content)) return timelineMessages;
+    const tsDB = loadTimestampDB();
+    const fp = makeFingerprint(msg);
+    const known = tsDB[fp] ? new Date(tsDB[fp]) : null;
+    const time = known && !Number.isNaN(known.getTime()) ? known : new Date();
+    if (!known) {
+      tsDB[fp] = time.toISOString();
+      saveTimestampDB(tsDB);
+    }
+    const copy = timelineMessages.slice();
+    copy[i] = { ...msg, content: `${formatDateTimeInTimeZone(time, TIME_ZONE)} ${msg.content}` };
+    return copy;
+  }
+  return timelineMessages;
+}
+
+function collectPendingWakeEvents(messages, lastIndex, oldTimeline, tsDB, store) {
+  // 下界 = 上一轮 assistant 回复的时间：优先用回复完成时记下的指纹时间，其次用网关最近一次完成回复的时间。
+  let lowerBound = null;
+  const previous = messages[lastIndex - 1];
+  if (previous && previous.role === "assistant") {
+    const text = anthropicContentToText(previous.content).trim();
+    if (text) {
+      const fp = makeFingerprint({ role: "assistant", content: text });
+      if (tsDB[fp]) lowerBound = new Date(tsDB[fp]);
+    }
+  }
+  if (!lowerBound && store.last_reply_at) lowerBound = new Date(store.last_reply_at);
+  // 没有任何下界（比如第一次切到原生路径）时宁可不注入，也不把很久以前的事件一次性堆进当前消息。
+  if (!lowerBound || Number.isNaN(lowerBound.getTime())) return [];
+  // 事件时间只精确到分钟，下界也向下取整到分钟再比较。
+  const floor = new Date(Math.floor(lowerBound.getTime() / 60000) * 60000);
+
+  const consumed = new Set(store.consumed_events);
+  const seen = new Set();
+  return oldTimeline
+    .filter(isSpecialEvent)
+    .map(event => normalizeContentToText(event.content))
+    .filter(content => {
+      if (seen.has(content) || consumed.has(content)) return false;
+      seen.add(content);
+      const time = extractTimestamp(content);
+      return Boolean(time) && time >= floor;
+    })
+    .sort((a, b) => extractTimestamp(a) - extractTimestamp(b));
+}
+
+// 批注 2026-10-20：原生路径的唤醒事件注入必须是“只追加”的，才能保住 prompt cache 和 thinking 签名：
+// 1. 新事件只写进本次请求的最后一条 user 消息（它本来就是新内容），绝不碰 system、绝不碰更早的消息；
+//    只注入上一轮 assistant 回复之后发生、且从未注入过的事件。
+// 2. Kelivo 下一轮发来的历史里，这条 user 消息是不带附注的原文；如果直接透传，上游看到的历史就和
+//    它上一轮实际看到的不一样，缓存从这里断开，后面那条 assistant 的 thinking 签名也会被判定为“历史被改”。
+//    所以每次注入都按 key 存进 native_injections.json，之后每一轮把同一段附注原样补回同一条消息，
+//    让上游看到的历史与它上次看到的逐字节一致（这是“恢复”上游见过的内容，不是改写历史）。
+function applyNativeWakeInjections(messages, oldTimeline, tsDB) {
+  const result = { messages, reapplied: 0, injectedEvents: 0 };
+  if (!Array.isArray(messages) || messages.length === 0) return result;
+
+  const store = loadNativeInjectionStore();
+  const entriesByKey = new Map(store.entries.map(entry => [entry.key, entry]));
+  const output = messages.slice();
+  const lastIndex = messages.length - 1;
+  let lastKey = null;
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg || msg.role !== "user") continue;
+    const key = injectionKey(messages[i - 1], msg);
+    if (i === lastIndex) lastKey = key;
+    const entry = entriesByKey.get(key);
+    if (!entry) continue;
+    output[i] = applyInjection(msg, entry.note);
+    result.reapplied++;
+  }
+
+  // 只有最后一条消息本身是 user 时才做新注入；否则不动任何消息。
+  if (lastKey && !entriesByKey.has(lastKey)) {
+    const pending = collectPendingWakeEvents(messages, lastIndex, oldTimeline, tsDB, store);
+    if (pending.length > 0) {
+      const note = buildInjectionNote(pending);
+      output[lastIndex] = applyInjection(messages[lastIndex], note);
+      store.entries.push({ key: lastKey, note, events: pending, created_at: new Date().toISOString() });
+      store.consumed_events.push(...pending);
+      saveNativeInjectionStore(store);
+      result.injectedEvents = pending.length;
+    }
+  }
+
+  result.messages = output;
+  return result;
+}
+
+function recordNativeAssistantReply(text) {
+  const now = new Date();
+  const store = loadNativeInjectionStore();
+  store.last_reply_at = now.toISOString();
+  saveNativeInjectionStore(store);
+
+  const content = String(text || "").trim();
+  if (!content) return;
+  const msg = { role: "assistant", content };
+  const tsDB = loadTimestampDB();
+  tsDB[makeFingerprint(msg)] = now.toISOString();
+  tsDB[makeFingerprintStripped(msg)] = now.toISOString();
+  saveTimestampDB(tsDB);
+
+  const timeline = loadTimeline();
+  let maxPos = 0;
+  for (const item of timeline) {
+    if (item.position && item.position > maxPos) maxPos = item.position;
+  }
+  timeline.push({ ...msg, position: Math.floor(maxPos) + 1 });
+  saveTimeline(timeline);
+  console.log(JSON.stringify({ event: "anthropic_reply_recorded", text_chars: content.length }));
+}
+
+function scheduleNativeReplyRecord(text) {
+  // 回复先交给 Kelivo，再落盘时间线；写盘失败只记日志，不影响客户端。
+  setImmediate(() => {
+    try {
+      recordNativeAssistantReply(text);
+    } catch (err) {
+      console.error("记录 Claude 回复失败:", err.message);
+    }
+  });
+}
+
+const PASSTHROUGH_RESPONSE_HEADERS = ["request-id", "retry-after", "x-should-retry"];
+
+function upstreamResponseHeaders(response) {
+  const headers = {};
+  for (const [name, value] of response.headers) {
+    if (PASSTHROUGH_RESPONSE_HEADERS.includes(name) || name.startsWith("anthropic-")) headers[name] = value;
+  }
+  return headers;
+}
+
 let wakeUpLastHeartbeat = null;
 
 // ========================
@@ -422,6 +638,11 @@ const ENV_FILE = path.join(PROJECT_DIR, ".env");
 const PREFERRED_ENV_ORDER = [
   "TARGET_API_URL",
   "TARGET_API_KEY",
+  "ANTHROPIC_API_URL",
+  "ANTHROPIC_API_KEY",
+  "WAKE_API_FORMAT",
+  "WAKE_MAX_TOKENS",
+  "WAKE_CACHE_TTL",
   "GATEWAY_API_KEY",
   "MODEL_NAME",
   "BARK_KEY",
@@ -569,23 +790,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
 
     const kelivoMessages = body.messages || [];
     const oldTimeline = loadTimeline();
-
-    const tsDB = loadTimestampDB();
-    let tsDBDirty = false;
-    for (const msg of kelivoMessages) {
-      if (msg.role === "system") continue;
-      if (msg.role === "tool") continue;
-      const ts = extractTimestamp(normalizeContentToText(msg.content));
-      if (!ts) continue;
-      const fp = makeFingerprint(msg);
-      const fpStripped = makeFingerprintStripped(msg);
-      if (!tsDB[fp]) { tsDB[fp] = ts.toISOString(); tsDBDirty = true; }
-      if (!tsDB[fpStripped]) { tsDB[fpStripped] = ts.toISOString(); tsDBDirty = true; }
-    }
-    if (tsDBDirty) saveTimestampDB(tsDB);
-
-    const finalTimeline = buildTimeline(kelivoMessages, tsDB);
-    saveTimeline(finalTimeline);
+    const tsDB = recordIncomingTimeline(kelivoMessages);
 
     // Kelivo 发图时 content 常是数组。默认原样透传给视觉模型；
     // 如上游不支持图片，可设置 MULTIMODAL_MODE=text 退回文本占位。
@@ -740,6 +945,121 @@ app.post("/v1/chat/completions", async (req, reply) => {
   } catch (err) {
     console.error(err);
     reply.code(500).send({ error: err.message });
+  }
+});
+
+// ========================
+// Claude 原生 Messages API（Kelivo 的 Claude 供应商会 POST {baseURL}/messages）
+// ========================
+app.post("/v1/messages", async (req, reply) => {
+  const body = req.body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return reply.code(400).send(anthropicError("invalid_request_error", "请求体必须是 JSON 对象"));
+  }
+
+  // 只记摘要：不写 system、消息正文、Key 或 beta 头的具体值。
+  console.log(JSON.stringify({
+    event: "anthropic_request",
+    model: body.model || "",
+    stream: body.stream === true,
+    has_system: Boolean(body.system),
+    has_beta_header: Boolean(req.headers["anthropic-beta"]),
+    messages: summarizeMessagesForLog(body.messages || [])
+  }));
+
+  const upstreamKey = anthropicApiKey();
+  if (!upstreamKey) {
+    return reply.code(500).send(anthropicError("api_error", "ANTHROPIC_API_KEY（或 TARGET_API_KEY）未配置"));
+  }
+
+  let forwardBody = body;
+  try {
+    const oldTimeline = loadTimeline();
+    const timelineMessages = ensureLastUserTimestamp(anthropicBodyToTimelineMessages(body));
+    const tsDB = recordIncomingTimeline(timelineMessages);
+    const injection = applyNativeWakeInjections(body.messages, oldTimeline, tsDB);
+    if (injection.messages !== body.messages) forwardBody = { ...body, messages: injection.messages };
+    console.log(JSON.stringify({
+      event: "anthropic_wake_injection",
+      new_events: injection.injectedEvents,
+      reapplied_notes: injection.reapplied
+    }));
+  } catch (err) {
+    // 时间线/注入失败不应该挡住聊天：退回纯透传。
+    console.error("Claude 原生路径时间线处理失败，改为纯透传:", err.message);
+    forwardBody = body;
+  }
+
+  const headers = {
+    "Content-Type": "application/json",
+    "x-api-key": upstreamKey,
+    "anthropic-version": String(req.headers["anthropic-version"] || "").trim() || DEFAULT_ANTHROPIC_VERSION
+  };
+  if (req.headers["anthropic-beta"]) headers["anthropic-beta"] = String(req.headers["anthropic-beta"]);
+
+  const controller = new AbortController();
+  let response;
+  try {
+    response = await fetch(anthropicApiUrl(), {
+      method: "POST",
+      headers,
+      body: JSON.stringify(forwardBody),
+      signal: controller.signal
+    });
+  } catch (err) {
+    console.error("Claude 上游请求失败:", err.message);
+    return reply.code(502).send(anthropicError("api_error", `上游请求失败：${err.message}`));
+  }
+
+  const upstreamContentType = response.headers.get("content-type") || "";
+  const passthroughHeaders = upstreamResponseHeaders(response);
+
+  // 非 SSE（包括所有错误响应）：状态码和响应体原样返回，Kelivo 才能显示真实报错。
+  if (!upstreamContentType.includes("text/event-stream") || !response.body) {
+    const responseText = await response.text();
+    if (response.ok) {
+      try {
+        scheduleNativeReplyRecord(extractResponseText(JSON.parse(responseText)));
+      } catch {}
+    }
+    return reply
+      .code(response.status)
+      .headers(passthroughHeaders)
+      .header("Content-Type", upstreamContentType || "application/json")
+      .send(responseText);
+  }
+
+  // SSE：逐块原样写给 Kelivo，同时旁路累积 text_delta，流结束后再记录回复。
+  reply.hijack();
+  reply.raw.writeHead(response.status, {
+    ...passthroughHeaders,
+    "Content-Type": upstreamContentType,
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive"
+  });
+
+  let finished = false;
+  reply.raw.on("close", () => {
+    // Kelivo 中途断开时同时取消上游，避免继续生成计费。
+    if (!finished) controller.abort();
+  });
+
+  const accumulator = createSseTextAccumulator();
+  try {
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      reply.raw.write(value);
+      try { accumulator.push(value); } catch {}
+    }
+    finished = true;
+    reply.raw.end();
+    if (response.ok) scheduleNativeReplyRecord(accumulator.finish());
+  } catch (err) {
+    finished = true;
+    if (err?.name !== "AbortError") console.error("Claude 流式转发中断:", err.message);
+    if (!reply.raw.writableEnded) reply.raw.end();
   }
 });
 
@@ -1764,6 +2084,7 @@ app.listen({ port: PORT, host: "0.0.0.0" }, (err, address) => {
     persistent_data: Boolean(process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH),
     target_url_configured: Boolean(TARGET_API_URL),
     target_key_configured: Boolean(process.env.TARGET_API_KEY),
+    anthropic_key_configured: Boolean(process.env.ANTHROPIC_API_KEY),
     model_configured: Boolean(process.env.MODEL_NAME),
     gateway_key_configured: Boolean(readEnvValue("GATEWAY_API_KEY")),
     data_dir_ready: fs.existsSync(DATA_DIR)
