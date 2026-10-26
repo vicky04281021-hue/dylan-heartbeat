@@ -775,8 +775,9 @@ function getCheckIntervalMs() {
 async function scheduleNextCheck() {
   try {
     // 发送心跳
+    // 批注 2026-10-26：心跳请求加超时；网关卡住不回时这里会永远等下去，唤醒循环停摆而服务仍显示 Online。
     try {
-      await fetch(HEARTBEAT_URL, { method: "POST" });
+      await fetch(HEARTBEAT_URL, { method: "POST", signal: AbortSignal.timeout(PUSH_TIMEOUT_MS) });
     } catch {}
     await runWakeUp();
   } catch (err) {
